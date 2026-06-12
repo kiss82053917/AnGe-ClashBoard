@@ -1,6 +1,6 @@
 <template>
   <div
-    class="card hover:bg-base-200 w-full cursor-pointer gap-2 p-2 text-sm"
+    class="card hover:bg-base-200 app-card-padding w-full cursor-pointer gap-3 text-sm"
     @click="openRuleProviderDetails"
   >
     <div class="flex h-6 items-center gap-2 leading-6">

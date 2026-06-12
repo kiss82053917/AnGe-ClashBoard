@@ -6,7 +6,7 @@
         class="min-h-0 flex-1 overflow-x-hidden overflow-y-auto"
         :style="padding"
       >
-        <div class="flex flex-col gap-2 p-2">
+        <div class="flex flex-col gap-3 p-3">
           <template
             v-if="
               (rulesTabShow === RULE_TAB_TYPE.RULES || rulesTabShow === RULE_TAB_TYPE.PROVIDER) &&
@@ -15,20 +15,20 @@
           >
             <div
               v-if="isRuleLookupLoading"
-              class="card p-2 text-sm"
+              class="card app-card-padding text-sm"
             >
               正在查询规则缓存...
             </div>
             <div
               v-else-if="ruleLookupError"
-              class="card p-2 text-sm"
+              class="card app-card-padding text-sm"
             >
               {{ ruleLookupError }}
             </div>
             <template v-else>
               <div
                 v-if="ruleLookupResults.length === 0 && ruleLookupDirectRules.length === 0"
-                class="card p-2 text-sm"
+                class="card app-card-padding text-sm"
               >
                 <div>未命中规则缓存。</div>
                 <div
@@ -40,7 +40,7 @@
               </div>
               <div
                 v-else
-                class="card p-2 text-sm"
+                class="card app-card-padding text-sm"
               >
                 只查询10行最相关数据：
               </div>
@@ -66,7 +66,7 @@
               />
               <div
                 v-if="ruleLookupUnsupported.length > 0"
-                class="card p-2 text-xs"
+                class="card app-card-padding text-xs"
               >
                 暂不支持解析的规则集：
                 {{ ruleLookupUnsupported.map((item) => item.name).join('、') }}
@@ -97,7 +97,7 @@
       class="min-h-0 flex-1"
       :style="virtualScrollerStyle"
       :data="renderRules"
-      :size="64"
+      :size="84"
     >
       <template #default="{ item: rule }: { item: Rule }">
         <RuleCard

@@ -8,8 +8,9 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { Client as SshClient } from 'ssh2'
 import { WebSocket, WebSocketServer } from 'ws'
-import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
+import { parse as parseYaml } from 'yaml'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
@@ -20,7 +21,6 @@ const host = process.env.HOST || '0.0.0.0'
 const port = Number(process.env.PORT || 2048)
 const backgroundImageStorageKey = '__background_image__'
 const execFileAsync = promisify(execFile)
-const defaultRuleSourceConfigPath = path.join(dataDir, 'rule-source.yaml')
 const defaultOpenClashUciConfigPath = '/etc/config/openclash'
 const defaultOpenClashConfigDir = '/etc/openclash/config'
 const openClashUciConfigPath =
@@ -46,10 +46,12 @@ const ACCESS_PASSWORD_ENABLED_KEY = 'config/access-password-enabled'
 const ACCESS_PASSWORD_KEY = 'config/access-password'
 const SETUP_API_LIST_KEY = 'setup/api-list'
 const SETUP_ACTIVE_UUID_KEY = 'setup/active-uuid'
+const RULE_PROVIDER_SOURCE_METADATA_KEY = 'rule-provider-cache/source-metadata'
 const ACCESS_SESSION_COOKIE_NAME = 'ange_clashboard_access_session'
 const ACCESS_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
 const ACCESS_PASSWORD_REQUIRED_CODE = 'ACCESS_PASSWORD_REQUIRED'
 const ACCESS_PASSWORD_INVALID_CODE = 'ACCESS_PASSWORD_INVALID'
+const RULE_SOURCE_SSH_REQUIRED_CODE = 'RULE_SOURCE_SSH_REQUIRED'
 const accessSessionSecret = randomBytes(32).toString('hex')
 const configuredRuleProviderAutoRefreshCheckMs = Number.parseInt(
   String(process.env.ZASHBOARD_RULE_PROVIDER_CACHE_AUTO_REFRESH_CHECK_MS || ''),
@@ -100,9 +102,6 @@ if ('serviceWorker' in navigator) {
 
 fs.mkdirSync(path.dirname(dbPath), { recursive: true })
 fs.mkdirSync(ruleSearchTempDir, { recursive: true })
-
-const ruleSourceConfigPath =
-  process.env.ZASHBOARD_RULE_SOURCE_PATH || defaultRuleSourceConfigPath
 
 const db = new DatabaseSync(dbPath)
 
@@ -378,6 +377,293 @@ const readActiveBackendConfig = () => {
   )
 }
 
+const normalizeRuleSourcePlugin = (value) => {
+  const normalizedValue = String(value || '').trim().toLowerCase()
+
+  return ['openclash', 'nikki'].includes(normalizedValue) ? normalizedValue : 'auto'
+}
+
+const getErrorMessage = (error) => (error instanceof Error ? error.message : String(error))
+const getErrorCode = (error) =>
+  error && typeof error === 'object' && typeof error.code === 'string' ? error.code : ''
+
+const createRuleSourceSshRequiredError = (detail = '') => {
+  const message = [
+    '规则源同步需要先配置 SSH 账号和密码，并确保规则源检测通过。',
+    '请在“修改后端配置”的“规则源 SSH”中填写 SSH 账号、SSH 密码，选择正确的 OpenClash/Nikki 后点击“检测规则源”。',
+    detail ? `当前错误：${detail}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const error = new Error(message)
+  error.code = RULE_SOURCE_SSH_REQUIRED_CODE
+
+  return error
+}
+
+const readOpenWrtRuleSourceSshConfig = () => {
+  const backend = readActiveBackendConfig()
+  const host = parseStoredString(process.env.ZASHBOARD_OPENWRT_SSH_HOST || backend?.host)
+  const port =
+    Number.parseInt(
+      parseStoredString(
+        process.env.ZASHBOARD_OPENWRT_SSH_PORT ||
+          backend?.ruleSourceSshPort ||
+          '22',
+      ),
+      10,
+    ) || 22
+  const username = parseStoredString(
+    process.env.ZASHBOARD_OPENWRT_SSH_USER ||
+      process.env.ZASHBOARD_OPENWRT_SSH_USERNAME ||
+      backend?.ruleSourceSshUsername ||
+      'root',
+  )
+  const password = parseStoredString(
+    process.env.ZASHBOARD_OPENWRT_SSH_PASSWORD || backend?.ruleSourceSshPassword,
+  )
+  const plugin = normalizeRuleSourcePlugin(
+    process.env.ZASHBOARD_RULE_SOURCE_PLUGIN || backend?.ruleSourcePlugin || 'auto',
+  )
+
+  return {
+    host,
+    port,
+    username,
+    password,
+    plugin,
+    configured: Boolean(host && username && password),
+  }
+}
+
+const sanitizeOpenWrtRuleSourceSshConfig = (config) => ({
+  host: config.host || '',
+  port: config.port || 22,
+  username: config.username || 'root',
+  password: config.password || '',
+  plugin: normalizeRuleSourcePlugin(config.plugin || 'auto'),
+  configured: Boolean(config.host && config.username && config.password),
+})
+
+const normalizeOpenWrtRuleSourceSshConfigInput = (input = {}) => {
+  const port = Number.parseInt(String(input.port || input.ruleSourceSshPort || '22'), 10)
+
+  return {
+    host: String(input.host || '').trim(),
+    port: Number.isFinite(port) && port > 0 ? port : 22,
+    username: String(input.username || input.user || input.ruleSourceSshUsername || 'root').trim() || 'root',
+    password: String(input.password || input.ruleSourceSshPassword || ''),
+    plugin: normalizeRuleSourcePlugin(input.plugin || input.ruleSourcePlugin || 'auto'),
+  }
+}
+
+const saveOpenWrtRuleSourceSshConfig = (config) => {
+  const backendListRow = getStorageValueStatement.get(SETUP_API_LIST_KEY)
+  const activeUuidRow = getStorageValueStatement.get(SETUP_ACTIVE_UUID_KEY)
+  const backendList = parseStoredJson(backendListRow?.value, [])
+  const activeUuid = parseStoredString(activeUuidRow?.value)
+
+  if (!Array.isArray(backendList) || !activeUuid) {
+    throw new Error('No active backend configured')
+  }
+
+  const backendIndex = backendList.findIndex((backend) => backend?.uuid === activeUuid)
+
+  if (backendIndex === -1) {
+    throw new Error('No active backend configured')
+  }
+
+  backendList[backendIndex] = {
+    ...backendList[backendIndex],
+    ruleSourcePlugin: normalizeRuleSourcePlugin(config.plugin || 'auto'),
+    ruleSourceSshPort: String(config.port || 22),
+    ruleSourceSshUsername: config.username || 'root',
+    ruleSourceSshPassword: config.password || '',
+  }
+
+  upsertStorageValueStatement.run(SETUP_API_LIST_KEY, JSON.stringify(backendList))
+}
+
+const shellQuote = (value) => `'${String(value).replace(/'/g, "'\\''")}'`
+
+const connectOpenWrtSsh = (config) => {
+  return new Promise((resolve, reject) => {
+    const client = new SshClient()
+    let settled = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      callback(value)
+    }
+
+    client
+      .on('ready', () => settle(resolve, client))
+      .on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
+        finish(prompts.map(() => config.password))
+      })
+      .on('close', () => {
+        settle(reject, new Error('OpenWrt SSH connection closed before it was ready.'))
+      })
+      .on('error', (error) => settle(reject, error))
+      .connect({
+        host: config.host,
+        port: config.port || 22,
+        username: config.username || 'root',
+        password: config.password,
+        tryKeyboard: true,
+        readyTimeout: 10000,
+      })
+  })
+}
+
+const sshExec = (client, command, options = {}) => {
+  const maxBuffer = options.maxBuffer || 8 * 1024 * 1024
+
+  return new Promise((resolve, reject) => {
+    client.exec(command, (error, stream) => {
+      if (error) {
+        reject(error)
+        return
+      }
+
+      let stdout = ''
+      let stderr = ''
+      let stdoutBytes = 0
+      let stderrBytes = 0
+
+      stream
+        .on('error', reject)
+        .on('close', (code) => {
+          resolve({
+            code,
+            stdout,
+            stderr,
+          })
+        })
+        .on('data', (chunk) => {
+          stdoutBytes += chunk.length
+          if (stdoutBytes > maxBuffer) {
+            stream.destroy(new Error('SSH command output is too large'))
+            return
+          }
+          stdout += chunk.toString('utf8')
+        })
+        .stderr.on('data', (chunk) => {
+          stderrBytes += chunk.length
+          if (stderrBytes > maxBuffer) {
+            stream.destroy(new Error('SSH command error output is too large'))
+            return
+          }
+          stderr += chunk.toString('utf8')
+        })
+    })
+  })
+}
+
+const withOpenWrtSshClient = async (config, callback) => {
+  if (!config.host || !config.username || !config.password) {
+    throw new Error('OpenWrt SSH is not configured. Set host, username and password first.')
+  }
+
+  const client = await connectOpenWrtSsh(config)
+
+  try {
+    return await callback(client)
+  } finally {
+    client.end()
+  }
+}
+
+const remoteFileExists = async (client, filePath) => {
+  const result = await sshExec(client, `[ -f ${shellQuote(filePath)} ] && printf 1 || printf 0`, {
+    maxBuffer: 1024,
+  })
+
+  return result.stdout.trim() === '1'
+}
+
+const readRemoteFile = async (client, filePath) => {
+  const result = await sshExec(client, `cat ${shellQuote(filePath)}`)
+
+  if (result.code !== 0) {
+    throw new Error(result.stderr.trim() || `Failed to read remote file: ${filePath}`)
+  }
+
+  return result.stdout
+}
+
+const remotePathExists = async (client, filePath) => {
+  const result = await sshExec(client, `[ -e ${shellQuote(filePath)} ] && printf 1 || printf 0`, {
+    maxBuffer: 1024,
+  })
+
+  return result.stdout.trim() === '1'
+}
+
+const dedupeStrings = (values) => [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))]
+
+const isRemoteYamlPath = (value) => /^\/\S+\.ya?ml$/i.test(String(value || '').trim())
+
+function extractRemoteYamlConfigPathsFromText(content) {
+  const candidates = []
+  const patterns = [
+    /(?:^|\s)(?:-f|--config|-config)\s+['"]?(\/[^\s'"]+\.ya?ml)['"]?(?=\s|$)/gi,
+    /(?:^|\s)(?:-f|--config|-config)=['"]?(\/[^\s'"]+\.ya?ml)['"]?(?=\s|$)/gi,
+    /['"]?(\/[^\s'"]+\.ya?ml)['"]?(?=\s|$)/gi,
+  ]
+
+  patterns.forEach((pattern) => {
+    for (const match of String(content || '').matchAll(pattern)) {
+      if (isRemoteYamlPath(match[1])) {
+        candidates.push(match[1])
+      }
+    }
+  })
+
+  return dedupeStrings(candidates)
+}
+
+function extractRemoteYamlConfigPathsFromUci(content) {
+  const candidates = []
+
+  String(content || '')
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const match = /^\s*(?:option|list)\s+\S+(?:\s+|=)(.+?)\s*$/.exec(line)
+
+      if (!match) {
+        return
+      }
+
+      const value = parseUciValue(match[1])
+
+      if (isRemoteYamlPath(value)) {
+        candidates.push(value)
+      }
+    })
+
+  return dedupeStrings([
+    ...candidates,
+    ...extractRemoteYamlConfigPathsFromText(content),
+  ])
+}
+
+const isOpenClashOwnedPath = (value) =>
+  /(?:^|\/)openclash(?:\/|$)/i.test(String(value || '').trim())
+
+const isNikkiProcessLine = (line) =>
+  /\bnikki\b|\/nikki(?:\/|$)/i.test(String(line || ''))
+
+function extractNikkiYamlConfigPathsFromProcessList(content) {
+  return dedupeStrings(
+    String(content || '')
+      .split(/\r?\n/)
+      .filter(isNikkiProcessLine)
+      .flatMap((line) => extractRemoteYamlConfigPathsFromText(line))
+      .filter((candidate) => !isOpenClashOwnedPath(candidate)),
+  )
+}
+
 const setRuleRefreshState = (partial) => {
   ruleRefreshState = {
     ...ruleRefreshState,
@@ -625,17 +911,24 @@ function resolveOpenClashConfigPathValue(configPath, options = {}) {
     return ''
   }
 
-  if (path.isAbsolute(normalizedConfigPath)) {
-    return path.normalize(normalizedConfigPath)
+  const pathApi = options.pathApi || path
+
+  if (pathApi.isAbsolute(normalizedConfigPath)) {
+    return pathApi.normalize(normalizedConfigPath)
   }
 
   const configDir = options.configDir || openClashConfigDir
   const uciConfigPath = options.uciConfigPath || openClashUciConfigPath
-  const candidates = [
-    path.resolve(configDir, normalizedConfigPath),
-    path.resolve(path.dirname(uciConfigPath), normalizedConfigPath),
-  ]
-  const existingCandidate = candidates.find((candidate) => fs.existsSync(candidate))
+  const candidates = options.preferExisting === false
+    ? [pathApi.resolve(configDir, normalizedConfigPath)]
+    : [
+        pathApi.resolve(configDir, normalizedConfigPath),
+        pathApi.resolve(pathApi.dirname(uciConfigPath), normalizedConfigPath),
+      ]
+  const existingCandidate =
+    options.preferExisting === false
+      ? ''
+      : candidates.find((candidate) => fs.existsSync(candidate))
 
   return existingCandidate || candidates[0]
 }
@@ -644,38 +937,7 @@ function resolveOpenClashConfigPathFromUci(content, options = {}) {
   return resolveOpenClashConfigPathValue(getOpenClashConfigPathFromUci(content), options)
 }
 
-function resolveOpenClashRuleSourceConfigPath() {
-  if (!fs.existsSync(openClashUciConfigPath)) {
-    return ''
-  }
-
-  try {
-    const configPath = resolveOpenClashConfigPathFromUci(
-      fs.readFileSync(openClashUciConfigPath, 'utf8'),
-    )
-
-    return configPath && fs.existsSync(configPath) ? configPath : ''
-  } catch {
-    return ''
-  }
-}
-
-function getRuntimeRuleSourceConfigPath() {
-  if (process.env.ZASHBOARD_RULE_SOURCE_PATH) {
-    return ruleSourceConfigPath
-  }
-
-  return resolveOpenClashRuleSourceConfigPath()
-}
-
-function extractRuleProviderEntries(configPath) {
-  if (!configPath || !fs.existsSync(configPath)) {
-    throw new Error(
-      'Rule source config is not configured. Mount the OpenClash UCI config_path source, or set ZASHBOARD_RULE_SOURCE_PATH.',
-    )
-  }
-
-  const content = fs.readFileSync(configPath, 'utf8')
+function extractRuleProviderEntriesFromContent(content) {
   const parsed = parseYaml(content)
   const providers = parsed?.['rule-providers']
 
@@ -709,242 +971,186 @@ function extractRuleProviderEntries(configPath) {
     .filter(Boolean)
 }
 
-function getRuleProviderSignature(providers) {
-  return JSON.stringify(
-    [...providers]
-      .map((provider) => ({
-        name: provider.name,
-        behavior: provider.behavior,
-        format: provider.format,
-        interval: provider.interval,
-        url: provider.url,
-      }))
-      .sort((left, right) => left.name.localeCompare(right.name)),
-  )
-}
+const getNikkiRuleSourceConfigPathCandidates = async (client) => {
+  const processResult = await sshExec(client, 'ps ww || ps w || ps', {
+    maxBuffer: 256 * 1024,
+  }).catch(() => null)
+  const processCandidates = extractNikkiYamlConfigPathsFromProcessList(processResult?.stdout || '')
+  const uciCandidates = []
 
-function stringifyManagedRuleSourceConfig(providers) {
-  const ruleProviders = Object.fromEntries(
-    [...providers].map((provider) => [
-      provider.name,
-      {
-        type: 'http',
-        interval: provider.interval,
-        behavior: provider.behavior,
-        format: provider.format,
-        url: provider.url,
-      },
-    ]),
-  )
-
-  return [
-    '# Managed rule-provider cache sources for AnGe-ClashBoard',
-    '# This file is auto-generated. Only rule-providers are kept here.',
-    '',
-    stringifyYaml({
-      'rule-providers': ruleProviders,
-    }).trimEnd(),
-    '',
-  ].join('\n')
-}
-
-function toManagedRuleProviderEntry(provider) {
-  const url = normalizeRuleProviderUrl(provider?.url || provider?.source_url)
-
-  if (!provider?.name || !url) {
-    return null
-  }
-
-  return {
-    name: String(provider.name).trim(),
-    behavior: typeof provider.behavior === 'string' ? provider.behavior : '',
-    format: typeof provider.format === 'string' ? provider.format : '',
-    interval:
-      typeof provider.interval === 'number'
-        ? provider.interval
-        : Number.parseInt(
-            String(provider.interval ?? provider.interval_seconds ?? '0'),
-            10,
-          ) || 0,
-    url,
-  }
-}
-
-function getManagedRuleSourceCandidateMap() {
-  const candidateMap = new Map()
-  const pushCandidate = (provider) => {
-    const entry = toManagedRuleProviderEntry(provider)
-
-    if (!entry || candidateMap.has(entry.name)) {
-      return
-    }
-
-    candidateMap.set(entry.name, entry)
-  }
-  const runtimeRuleSourceConfigPath = getRuntimeRuleSourceConfigPath()
-
-  if (runtimeRuleSourceConfigPath) {
-    extractRuleProviderEntries(runtimeRuleSourceConfigPath).forEach(pushCandidate)
-  }
-
-  return candidateMap
-}
-
-async function syncManagedRuleSourceConfigFromController(options = {}) {
-  if (
-    process.env.ZASHBOARD_RULE_SOURCE_PATH ||
-    ruleSourceConfigPath !== defaultRuleSourceConfigPath
-  ) {
-    return {
-      changed: false,
-      updatedProviders: 0,
-      path: ruleSourceConfigPath,
-      skipped: true,
-    }
-  }
-
-  const backend = options.backend || readActiveBackendConfig()
-
-  if (!backend) {
-    return {
-      changed: false,
-      updatedProviders: 0,
-      path: ruleSourceConfigPath,
-      skipped: true,
-      error: 'No active backend configured',
-    }
-  }
-
-  const runtimeRuleSourceConfigPath = getRuntimeRuleSourceConfigPath()
-
-  if (!runtimeRuleSourceConfigPath) {
-    return {
-      changed: false,
-      updatedProviders: 0,
-      path: ruleSourceConfigPath,
-      skipped: true,
-      error:
-        'Rule source config is not configured. Mount the OpenClash UCI config_path source, or set ZASHBOARD_RULE_SOURCE_PATH.',
-    }
-  }
-
-  const requestedProviderNames =
-    Array.isArray(options.providerNames) && options.providerNames.length > 0
-      ? [...new Set(options.providerNames.map((name) => String(name || '').trim()).filter(Boolean))]
-      : null
-  const controllerRules = await fetchControllerRules(backend)
-  const controllerReferencedProviderNames = getReferencedProviderNamesFromControllerRules(controllerRules)
-  const referencedProviderNames = requestedProviderNames
-    ? [...new Set([...controllerReferencedProviderNames, ...requestedProviderNames])]
-    : controllerReferencedProviderNames
-  const controllerProviders = await fetchControllerRuleProviders(backend)
-  const controllerProviderMap = new Map(
-    controllerProviders.map((provider) => [String(provider?.name || '').trim(), provider]),
-  )
-  const candidateMap = getManagedRuleSourceCandidateMap()
-  const currentProviderEntries = fs.existsSync(defaultRuleSourceConfigPath)
-    ? extractRuleProviderEntries(defaultRuleSourceConfigPath)
-    : []
-  const nextProviders = []
-  const unresolvedProviders = []
-
-  for (const providerName of referencedProviderNames) {
-    const controllerProvider = controllerProviderMap.get(providerName)
-    const baseProvider = candidateMap.get(providerName)
-
-    if (!baseProvider) {
-      unresolvedProviders.push(providerName)
-      continue
-    }
-
-    nextProviders.push({
-      ...baseProvider,
-      behavior: controllerProvider?.behavior || baseProvider.behavior,
-      format: controllerProvider?.format || baseProvider.format,
-    })
-  }
-
-  const defaultConfigMissing = !fs.existsSync(defaultRuleSourceConfigPath)
-  const currentProviderSignature = getRuleProviderSignature(currentProviderEntries)
-  const nextProviderSignature = getRuleProviderSignature(nextProviders)
-  const shouldWriteConfig =
-    defaultConfigMissing ||
-    currentProviderSignature !== nextProviderSignature
-
-  if (shouldWriteConfig && (!requestedProviderNames || nextProviders.length > 0)) {
-    fs.mkdirSync(path.dirname(defaultRuleSourceConfigPath), { recursive: true })
-    fs.writeFileSync(defaultRuleSourceConfigPath, stringifyManagedRuleSourceConfig(nextProviders))
-  }
-
-  return {
-    changed: shouldWriteConfig && (!requestedProviderNames || nextProviders.length > 0),
-    updatedProviders: nextProviders.length,
-    unresolvedProviders,
-    path: defaultRuleSourceConfigPath,
-    skipped: false,
-  }
-}
-
-function syncManagedRuleSourceConfigFromRuntimeSource() {
-  const runtimeRuleSourceConfigPath = getRuntimeRuleSourceConfigPath()
-
-  if (
-    process.env.ZASHBOARD_RULE_SOURCE_PATH ||
-    ruleSourceConfigPath !== defaultRuleSourceConfigPath ||
-    !runtimeRuleSourceConfigPath
-  ) {
-    return {
-      changed: false,
-      updatedProviders: 0,
-      path: ruleSourceConfigPath,
-      skipped: true,
-    }
-  }
-
-  const runtimeProviderEntries = extractRuleProviderEntries(runtimeRuleSourceConfigPath)
-  const defaultConfigMissing = !fs.existsSync(defaultRuleSourceConfigPath)
-  const currentProviderEntries = fs.existsSync(defaultRuleSourceConfigPath)
-    ? extractRuleProviderEntries(defaultRuleSourceConfigPath)
-    : []
-  const currentProviderMap = new Map(currentProviderEntries.map((provider) => [provider.name, provider]))
-  const runtimeProviderMap = new Map(runtimeProviderEntries.map((provider) => [provider.name, provider]))
-  const currentProviderSignature = getRuleProviderSignature(currentProviderEntries)
-  const runtimeProviderSignature = getRuleProviderSignature(runtimeProviderEntries)
-  let updatedProviders = 0
-
-  for (const provider of runtimeProviderEntries) {
-    const currentProvider = currentProviderMap.get(provider.name)
-
-    if (
-      !currentProvider ||
-      currentProvider.url !== provider.url ||
-      currentProvider.behavior !== provider.behavior ||
-      currentProvider.format !== provider.format ||
-      currentProvider.interval !== provider.interval
-    ) {
-      updatedProviders++
-    }
-  }
-
-  for (const provider of currentProviderEntries) {
-    if (!runtimeProviderMap.has(provider.name)) {
-      updatedProviders++
-    }
-  }
-
-  if (defaultConfigMissing || currentProviderSignature !== runtimeProviderSignature) {
-    fs.mkdirSync(path.dirname(defaultRuleSourceConfigPath), { recursive: true })
-    fs.writeFileSync(
-      defaultRuleSourceConfigPath,
-      stringifyManagedRuleSourceConfig(runtimeProviderEntries),
+  if (await remoteFileExists(client, '/etc/config/nikki')) {
+    const uciContent = await readRemoteFile(client, '/etc/config/nikki')
+    uciCandidates.push(
+      ...extractRemoteYamlConfigPathsFromUci(uciContent).filter(
+        (candidate) => !isOpenClashOwnedPath(candidate),
+      ),
     )
   }
 
+  return dedupeStrings([
+    ...processCandidates,
+    ...uciCandidates,
+    '/etc/nikki/run/config.yaml',
+    '/etc/nikki/run/config.yml',
+    '/var/etc/nikki/config.yaml',
+    '/var/run/nikki/config.yaml',
+    '/tmp/etc/nikki/config.yaml',
+  ])
+}
+
+const detectNikkiRuleSourceFromOpenWrtClient = async (client) => {
+  const configPathCandidates = await getNikkiRuleSourceConfigPathCandidates(client)
+  const checkedExistingPaths = []
+
+  for (const configPath of configPathCandidates) {
+    if (!(await remoteFileExists(client, configPath))) {
+      continue
+    }
+
+    checkedExistingPaths.push(configPath)
+
+    const content = await readRemoteFile(client, configPath)
+    const providers = extractRuleProviderEntriesFromContent(content)
+
+    if (providers.length === 0) {
+      continue
+    }
+
+    return {
+      plugin: 'nikki',
+      configPath,
+      providers,
+    }
+  }
+
+  if (
+    checkedExistingPaths.length > 0 ||
+    (await remoteFileExists(client, '/etc/config/nikki')) ||
+    (await remotePathExists(client, '/etc/nikki'))
+  ) {
+    throw new Error(
+      `Nikki detected, but no readable YAML with rule-providers was found${
+        checkedExistingPaths.length > 0 ? `: ${checkedExistingPaths.join(', ')}` : ''
+      }.`,
+    )
+  }
+
+  return null
+}
+
+const detectOpenClashRuleSourceFromOpenWrtClient = async (client) => {
+  if (!(await remoteFileExists(client, openClashUciConfigPath))) {
+    return null
+  }
+
+  const uciContent = await readRemoteFile(client, openClashUciConfigPath)
+  const configPath = resolveOpenClashConfigPathFromUci(uciContent, {
+    configDir: openClashConfigDir,
+    uciConfigPath: openClashUciConfigPath,
+    pathApi: path.posix,
+    preferExisting: false,
+  })
+
+  if (!configPath) {
+    throw new Error('OpenClash detected, but option config_path is missing.')
+  }
+
+  if (!(await remoteFileExists(client, configPath))) {
+    throw new Error(`OpenClash config_path file does not exist: ${configPath}`)
+  }
+
+  const content = await readRemoteFile(client, configPath)
+
   return {
-    changed: defaultConfigMissing || currentProviderSignature !== runtimeProviderSignature,
-    updatedProviders,
-    path: defaultRuleSourceConfigPath,
-    skipped: false,
+    plugin: 'openclash',
+    configPath,
+    providers: extractRuleProviderEntriesFromContent(content),
+  }
+}
+
+const collectRuleSourceSnapshotsFromOpenWrtClient = async (client, requestedPlugin = 'auto') => {
+  const plugin = normalizeRuleSourcePlugin(requestedPlugin)
+  const snapshots = []
+  const errors = []
+  const detectors = [
+    ['openclash', detectOpenClashRuleSourceFromOpenWrtClient],
+    ['nikki', detectNikkiRuleSourceFromOpenWrtClient],
+  ].filter(([name]) => plugin === 'auto' || plugin === name)
+
+  for (const [name, detector] of detectors) {
+    try {
+      const snapshot = await detector(client)
+
+      if (snapshot) {
+        snapshots.push(snapshot)
+      }
+    } catch (error) {
+      errors.push({
+        plugin: name,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  return {
+    plugin,
+    snapshots,
+    errors,
+  }
+}
+
+const detectRuleSourceFromOpenWrtClient = async (client, requestedPlugin = 'auto') => {
+  const { plugin, snapshots, errors } = await collectRuleSourceSnapshotsFromOpenWrtClient(
+    client,
+    requestedPlugin,
+  )
+
+  if (snapshots.length > 0) {
+    return {
+      ...snapshots[0],
+      selectedPlugin: snapshots[0].plugin,
+      availablePlugins: snapshots.map((snapshot) => snapshot.plugin),
+      pluginErrors: errors,
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(errors.map((entry) => `${entry.plugin}: ${entry.message}`).join('; '))
+  }
+
+  throw new Error(
+    plugin === 'auto'
+      ? 'OpenClash or Nikki was not detected on the OpenWrt host.'
+      : `${plugin} was not detected on the OpenWrt host.`,
+  )
+}
+
+const getOpenWrtRuleSourceSnapshot = async (options = {}) => {
+  const config = options.config || readOpenWrtRuleSourceSshConfig()
+
+  if (!config.configured && !options.required) {
+    return null
+  }
+
+  return await withOpenWrtSshClient(config, (client) =>
+    detectRuleSourceFromOpenWrtClient(client, config.plugin),
+  )
+}
+
+const assertRuleSourceReadyForSync = async () => {
+  const config = readOpenWrtRuleSourceSshConfig()
+
+  if (!config.configured) {
+    throw createRuleSourceSshRequiredError()
+  }
+
+  try {
+    return await getOpenWrtRuleSourceSnapshot({
+      config,
+      required: true,
+    })
+  } catch (error) {
+    throw createRuleSourceSshRequiredError(getErrorMessage(error))
   }
 }
 
@@ -2393,36 +2599,98 @@ const getRuleProviderCacheProviderCounts = () => {
   )
 }
 
-const getRuleProviderSourceUrlMap = () => {
-  const sourceUrlMap = {}
-  const pushSourceUrlsFromConfig = (configPath, overwrite = false) => {
-    if (!configPath || !fs.existsSync(configPath)) {
-      return
-    }
+const buildRuleProviderSourceMetadata = (providers, extra = {}) => ({
+  providerUrls: Object.fromEntries(
+    providers
+      .filter((provider) => provider.name && provider.url)
+      .map((provider) => [provider.name, provider.url]),
+  ),
+  providerOrder: providers
+    .map((provider) => String(provider.name || '').trim())
+    .filter(Boolean),
+  plugin: extra.plugin || '',
+  configPath: extra.configPath || '',
+  updatedAt: Date.now(),
+})
 
-    try {
-      extractRuleProviderEntries(configPath).forEach((provider) => {
-        if (provider.name && provider.url && (overwrite || !sourceUrlMap[provider.name])) {
-          sourceUrlMap[provider.name] = provider.url
-        }
-      })
-    } catch {
-      // Ignore missing or invalid source config; callers will see an empty source map.
-    }
+const normalizeRuleProviderSourceMetadata = (metadata = {}) => {
+  const providerUrls =
+    metadata?.providerUrls &&
+    typeof metadata.providerUrls === 'object' &&
+    !Array.isArray(metadata.providerUrls)
+      ? Object.fromEntries(
+          Object.entries(metadata.providerUrls)
+            .map(([name, url]) => [String(name || '').trim(), normalizeRuleProviderUrl(url)])
+            .filter(([name, url]) => name && url),
+        )
+      : {}
+  const providerOrder = Array.isArray(metadata?.providerOrder)
+    ? [...new Set(metadata.providerOrder.map((name) => String(name || '').trim()).filter(Boolean))]
+    : []
+
+  return {
+    providerUrls,
+    providerOrder,
+    plugin: typeof metadata?.plugin === 'string' ? metadata.plugin : '',
+    configPath: typeof metadata?.configPath === 'string' ? metadata.configPath : '',
+    updatedAt: Number(metadata?.updatedAt || 0) || 0,
   }
-
-  pushSourceUrlsFromConfig(getRuntimeRuleSourceConfigPath(), true)
-
-  return sourceUrlMap
 }
 
-const getRuleProviderOrderList = () => {
+const hasRuleProviderSourceMetadata = (metadata) =>
+  Object.keys(metadata.providerUrls || {}).length > 0 || (metadata.providerOrder || []).length > 0
+
+const saveRuleProviderSourceMetadata = (providers, extra = {}) => {
+  const metadata = buildRuleProviderSourceMetadata(providers, extra)
+
+  upsertStorageValueStatement.run(
+    RULE_PROVIDER_SOURCE_METADATA_KEY,
+    JSON.stringify(metadata),
+  )
+
+  return normalizeRuleProviderSourceMetadata(metadata)
+}
+
+const getCachedRuleProviderSourceMetadata = () => {
+  const row = getStorageValueStatement.get(RULE_PROVIDER_SOURCE_METADATA_KEY)
+  const storedMetadata = normalizeRuleProviderSourceMetadata(parseStoredJson(row?.value, {}))
+
+  if (hasRuleProviderSourceMetadata(storedMetadata)) {
+    return storedMetadata
+  }
+
+  const cachedProviders = getCachedRuleProviderStatement.all()
+
+  return normalizeRuleProviderSourceMetadata({
+    providerUrls: Object.fromEntries(
+      cachedProviders
+        .filter((provider) => provider.name && provider.source_url)
+        .map((provider) => [provider.name, provider.source_url]),
+    ),
+    providerOrder: cachedProviders.map((provider) => provider.name),
+  })
+}
+
+const getRuleProviderSourceMetadata = async (options = {}) => {
+  const cachedMetadata = getCachedRuleProviderSourceMetadata()
+
+  if (hasRuleProviderSourceMetadata(cachedMetadata) || options.allowLive === false) {
+    return cachedMetadata
+  }
+
   try {
-    return extractRuleProviderEntries(getRuntimeRuleSourceConfigPath())
-      .map((provider) => String(provider.name || '').trim())
-      .filter(Boolean)
+    const snapshot = await getOpenWrtRuleSourceSnapshot()
+
+    if (!snapshot) {
+      return cachedMetadata
+    }
+
+    return saveRuleProviderSourceMetadata(snapshot.providers, {
+      plugin: snapshot.plugin,
+      configPath: snapshot.configPath,
+    })
   } catch {
-    return []
+    return cachedMetadata
   }
 }
 
@@ -2532,43 +2800,23 @@ const updateRuleProviderCache = async (options = {}) => {
       Array.isArray(options.providerNames) && options.providerNames.length > 0
         ? [...new Set(options.providerNames.map((name) => String(name || '').trim()).filter(Boolean))]
         : null
-    const backend = options.backend || readActiveBackendConfig()
-    let ruleSourceConfigSync = {
+    const ruleSourceSnapshot = options.ruleSourceSnapshot || (await assertRuleSourceReadyForSync())
+    const runtimeProviderEntries = ruleSourceSnapshot.providers
+    const sourceMetadata = saveRuleProviderSourceMetadata(runtimeProviderEntries, {
+      plugin: ruleSourceSnapshot.plugin,
+      configPath: ruleSourceSnapshot.configPath,
+    })
+
+    const ruleSourceConfigSync = {
       changed: false,
-      updatedProviders: 0,
-      path: ruleSourceConfigPath,
+      updatedProviders: runtimeProviderEntries.length,
+      path: ruleSourceSnapshot.configPath,
       skipped: false,
       error: '',
+      plugin: ruleSourceSnapshot.plugin,
     }
 
-    try {
-      ruleSourceConfigSync = {
-        ...ruleSourceConfigSync,
-        ...(await syncManagedRuleSourceConfigFromController({
-          backend,
-          providerNames,
-        })),
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      console.warn('Failed to sync managed rule-source.yaml from controller before refresh', error)
-
-      try {
-        ruleSourceConfigSync = {
-          ...ruleSourceConfigSync,
-          ...syncManagedRuleSourceConfigFromRuntimeSource(),
-          error: message,
-        }
-      } catch (fallbackError) {
-        console.warn('Failed to sync managed rule-source.yaml from runtime source before refresh', fallbackError)
-        ruleSourceConfigSync = {
-          ...ruleSourceConfigSync,
-          error: message,
-        }
-      }
-    }
-
-    const providers = extractRuleProviderEntries(getRuntimeRuleSourceConfigPath())
+    const providers = runtimeProviderEntries
       .map((provider) => ({
         ...provider,
         kind: getRuleProviderKind(provider.url, provider.format, provider.behavior),
@@ -2576,9 +2824,7 @@ const updateRuleProviderCache = async (options = {}) => {
       .filter((provider) => !providerNames || providerNames.includes(provider.name))
     const configuredProviderNameSet = new Set(providers.map((provider) => provider.name))
     const unresolvedProviderNames =
-      providerNames?.filter((providerName) => !configuredProviderNameSet.has(providerName)) ||
-      ruleSourceConfigSync.unresolvedProviders ||
-      []
+      providerNames?.filter((providerName) => !configuredProviderNameSet.has(providerName)) || []
     const cachedProviderMap = new Map(
       getCachedRuleProviderStatement.all().map((provider) => [provider.name, provider]),
     )
@@ -2586,7 +2832,7 @@ const updateRuleProviderCache = async (options = {}) => {
       name: providerName,
       url: '',
       message:
-        `Rule provider source URL is not configured for "${providerName}". Mount the current OpenClash config_path source, or set ZASHBOARD_RULE_SOURCE_PATH.`,
+        `Rule provider source URL is not configured for "${providerName}". Check the current OpenClash/Nikki YAML read through OpenWrt SSH.`,
     }))
     let updatedCount = 0
     let progressRules = 0
@@ -2702,8 +2948,8 @@ const updateRuleProviderCache = async (options = {}) => {
       providerNames,
       totalRules: getRuleProviderCacheRuleCount(),
       providerCounts: getRuleProviderCacheProviderCounts(),
-      providerUrls: getRuleProviderSourceUrlMap(),
-      providerOrder: getRuleProviderOrderList(),
+      providerUrls: sourceMetadata.providerUrls,
+      providerOrder: sourceMetadata.providerOrder,
       progressRules,
       cancelled,
       errors,
@@ -2738,16 +2984,10 @@ const runRuleProviderAutoRefresh = async (reason = 'interval') => {
   try {
     const result = await updateRuleProviderCache({ force: false })
 
-    if (result.updatedCount > 0 || result.errors.length > 0 || result.ruleSourceConfigSync?.changed) {
+    if (result.updatedCount > 0 || result.errors.length > 0) {
       console.log(
         `[rule-provider-cache] auto refresh (${reason}) finished: ${result.updatedCount}/${result.totalProviders} providers updated, ${result.totalRules} rules cached`,
       )
-
-      if (result.ruleSourceConfigSync?.changed) {
-        console.log(
-          `[rule-provider-cache] synchronized managed rule-source.yaml before auto refresh: ${result.ruleSourceConfigSync.path}`,
-        )
-      }
 
       if (result.errors.length > 0) {
         console.warn(
@@ -2792,13 +3032,13 @@ const getRuleRefreshResponsePayload = (options = {}) => {
     progress: ruleProviderUpdateState,
     totalRules: getRuleProviderCacheRuleCount(),
     providerCounts: getRuleProviderCacheProviderCounts(),
-    providerUrls: getRuleProviderSourceUrlMap(),
-    providerOrder: getRuleProviderOrderList(),
+    providerUrls: {},
+    providerOrder: [],
     providerName,
   }
 }
 
-const startBackgroundRuleRefresh = (options = {}) => {
+const startBackgroundRuleRefresh = async (options = {}) => {
   const targetProviderName = typeof options.providerName === 'string' ? options.providerName.trim() : ''
   const referencedOnly = options.referencedOnly === true
   const requestedProviderNames = targetProviderName
@@ -2822,6 +3062,8 @@ const startBackgroundRuleRefresh = (options = {}) => {
   if (!backend) {
     throw new Error('No active backend configured')
   }
+
+  const ruleSourceSnapshot = await assertRuleSourceReadyForSync()
 
   activeRuleRefreshController = new AbortController()
   ruleRefreshRunId += 1
@@ -2916,6 +3158,7 @@ const startBackgroundRuleRefresh = (options = {}) => {
       const cacheResult = await updateRuleProviderCache({
         force: true,
         providerNames: targetProviderNames.length > 0 ? targetProviderNames : null,
+        ruleSourceSnapshot,
       })
       const targetTotalRules =
         targetProviderNames.length > 0
@@ -3012,11 +3255,15 @@ const searchRuleProviderCache = async (query, options = {}) => {
   const cachedProviders = getCachedRuleProviderStatement
     .all()
     .filter((provider) => !hasProviderFilter || providerNames.has(provider.name))
-  const configuredProviders = extractRuleProviderEntries(getRuntimeRuleSourceConfigPath()).map((provider) => ({
-    ...provider,
-    kind: getRuleProviderKind(provider.url, provider.format, provider.behavior),
-  }))
-  const configuredProviderMap = new Map(configuredProviders.map((provider) => [provider.name, provider]))
+  const cachedSourceMetadata = getCachedRuleProviderSourceMetadata()
+  const needsLiveSourceMetadata =
+    cachedProviders.length > 0 &&
+    cachedProviders.some(
+      (provider) => !provider.source_url && !cachedSourceMetadata.providerUrls[provider.name],
+    )
+  const sourceMetadata = needsLiveSourceMetadata
+    ? await getRuleProviderSourceMetadata()
+    : cachedSourceMetadata
   const matches = []
   const unsupported = []
   const directRuleIndexes = []
@@ -3025,18 +3272,17 @@ const searchRuleProviderCache = async (query, options = {}) => {
     const providerMatches = await findMatchesInTextRulesByLookups(lookups, provider.body)
 
     if (providerMatches.length > 0) {
-      const configuredProvider = configuredProviderMap.get(provider.name)
-        matches.push({
-          name: provider.name,
-          behavior: provider.behavior,
-          format: provider.format,
-          url: configuredProvider?.url || normalizeRuleProviderUrl(provider.source_url),
-          totalRules: countRulesInBody(provider.body),
-          status: 'cached',
-          matches: sortRuleMatchesByLookup(lookup, providerMatches).slice(0, 20),
-        })
-      }
+      matches.push({
+        name: provider.name,
+        behavior: provider.behavior,
+        format: provider.format,
+        url: sourceMetadata.providerUrls[provider.name] || normalizeRuleProviderUrl(provider.source_url),
+        totalRules: countRulesInBody(provider.body),
+        status: 'cached',
+        matches: sortRuleMatchesByLookup(lookup, providerMatches).slice(0, 20),
+      })
     }
+  }
 
   rules.forEach((rule) => {
     if (normalizeRuleTypeName(rule?.type) === 'RULE-SET') {
@@ -3077,7 +3323,7 @@ const searchRuleProviderCache = async (query, options = {}) => {
     directRuleIndexes: [...new Set(directRuleIndexes)].sort((left, right) => left - right),
     unsupported,
     errors: [],
-    totalProviders: configuredProviders.length,
+    totalProviders: sourceMetadata.providerOrder.length || cachedProviders.length,
     cachedProviders: cachedProviders.length,
   }
 }
@@ -3091,6 +3337,7 @@ app.use('/api/rule-refresh', express.json({ limit: '2kb' }))
 app.use('/api/rule-provider-penetration', express.json({ limit: '2kb' }))
 app.use('/api/rule-provider-search', express.json({ limit: '128kb' }))
 app.use('/api/storage', express.json({ limit: '25mb' }))
+app.use('/api/openwrt-rule-source', express.json({ limit: '8kb' }))
 app.use('/api/background-image', express.json({ limit: '25mb' }))
 app.use('/api/proxy-group-rule-penetration', express.json({ limit: '5mb' }))
 app.use('/api/controller', express.raw({ type: '*/*', limit: '25mb' }))
@@ -3185,6 +3432,69 @@ app.get('/api/health', (_req, res) => {
   })
 })
 
+app.get('/api/openwrt-rule-source/config', (_req, res) => {
+  res.json({
+    config: sanitizeOpenWrtRuleSourceSshConfig(readOpenWrtRuleSourceSshConfig()),
+  })
+})
+
+app.put('/api/openwrt-rule-source/config', (req, res) => {
+  const config = normalizeOpenWrtRuleSourceSshConfigInput(req.body?.config || req.body)
+
+  try {
+    saveOpenWrtRuleSourceSshConfig(config)
+
+    res.json({
+      ok: true,
+      config: sanitizeOpenWrtRuleSourceSshConfig(readOpenWrtRuleSourceSshConfig()),
+    })
+  } catch (error) {
+    res.status(500).json({
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
+})
+
+app.post('/api/openwrt-rule-source/detect', async (req, res) => {
+  const config = req.body?.config
+    ? {
+        ...normalizeOpenWrtRuleSourceSshConfigInput(req.body.config),
+        configured: true,
+      }
+    : readOpenWrtRuleSourceSshConfig()
+
+  try {
+    const snapshot = await getOpenWrtRuleSourceSnapshot({
+      config,
+      required: true,
+    })
+
+    if (!snapshot) {
+      throw new Error('OpenWrt SSH rule source is not configured.')
+    }
+
+    res.json({
+      ok: true,
+      plugin: snapshot.plugin,
+      selectedPlugin: snapshot.selectedPlugin || snapshot.plugin,
+      availablePlugins: snapshot.availablePlugins || [snapshot.plugin],
+      pluginErrors: snapshot.pluginErrors || [],
+      configPath: snapshot.configPath,
+      providerCount: snapshot.providers.length,
+      providers: snapshot.providers.slice(0, 20).map((provider) => ({
+        name: provider.name,
+        behavior: provider.behavior,
+        format: provider.format,
+        url: provider.url,
+      })),
+    })
+  } catch (error) {
+    res.status(500).json({
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
+})
+
 app.all(/^\/api\/controller(?:\/.*)?$/, proxyControllerRequest)
 
 app.get('/api/storage', (_req, res) => {
@@ -3250,7 +3560,8 @@ app.post('/api/rule-provider-cache/update', async (_req, res) => {
     res.json(await updateRuleProviderCache())
   } catch (error) {
     res.status(500).json({
-      message: error instanceof Error ? error.message : String(error),
+      code: getErrorCode(error),
+      message: getErrorMessage(error),
     })
   }
 })
@@ -3262,7 +3573,7 @@ app.post('/api/rule-provider-cache/cancel', (_req, res) => {
   })
 })
 
-app.post('/api/rule-refresh/start', (req, res) => {
+app.post('/api/rule-refresh/start', async (req, res) => {
   try {
     const providerName =
       typeof req.body?.providerName === 'string' ? req.body.providerName.trim() : ''
@@ -3272,7 +3583,7 @@ app.post('/api/rule-refresh/start', (req, res) => {
       : []
 
     res.json(
-      startBackgroundRuleRefresh({
+      await startBackgroundRuleRefresh({
         providerName,
         referencedOnly,
         providerNames,
@@ -3280,7 +3591,8 @@ app.post('/api/rule-refresh/start', (req, res) => {
     )
   } catch (error) {
     res.status(500).json({
-      message: error instanceof Error ? error.message : String(error),
+      code: getErrorCode(error),
+      message: getErrorMessage(error),
     })
   }
 })
@@ -3289,12 +3601,14 @@ app.post('/api/rule-refresh/cancel', (_req, res) => {
   res.json(cancelBackgroundRuleRefresh())
 })
 
-app.get('/api/rule-provider-cache/stats', (_req, res) => {
+app.get('/api/rule-provider-cache/stats', async (_req, res) => {
+  const sourceMetadata = await getRuleProviderSourceMetadata()
+
   res.json({
     totalRules: getRuleProviderCacheRuleCount(),
     providerCounts: getRuleProviderCacheProviderCounts(),
-    providerUrls: getRuleProviderSourceUrlMap(),
-    providerOrder: getRuleProviderOrderList(),
+    providerUrls: sourceMetadata.providerUrls,
+    providerOrder: sourceMetadata.providerOrder,
     progress: ruleProviderUpdateState,
     refresh: ruleRefreshState,
   })
@@ -3643,7 +3957,10 @@ export {
   ACCESS_PASSWORD_REQUIRED_CODE,
   app,
   createAccessSessionToken as createAccessSessionTokenForTesting,
+  extractNikkiYamlConfigPathsFromProcessList as extractNikkiYamlConfigPathsFromProcessListForTesting,
   db,
+  extractRemoteYamlConfigPathsFromText as extractRemoteYamlConfigPathsFromTextForTesting,
+  extractRemoteYamlConfigPathsFromUci as extractRemoteYamlConfigPathsFromUciForTesting,
   getRequestAccessAuthStatus as getRequestAccessAuthStatusForTesting,
   resolveOpenClashConfigPathFromUci as resolveOpenClashConfigPathFromUciForTesting,
   readSnapshot,

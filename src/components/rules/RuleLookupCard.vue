@@ -1,6 +1,6 @@
 <template>
   <div class="card">
-    <div class="flex flex-col gap-2 p-2 text-sm">
+    <div class="app-card-padding flex flex-col gap-3 text-sm">
       <div class="flex flex-wrap items-center gap-2">
         <span>{{ index }}.</span>
         <span class="text-main font-medium">
@@ -68,7 +68,10 @@
         </div>
       </div>
 
-      <div class="text-base-content/70 flex items-center gap-2 text-sm font-normal">
+      <div
+        v-if="result.url"
+        class="text-base-content/70 flex items-center gap-2 text-sm font-normal"
+      >
         <a
           :href="result.url"
           target="_blank"

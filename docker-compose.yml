@@ -1,0 +1,23 @@
+# AnGe-ClashBoard 面板 — iStore / 软路由 Docker 一键部署
+#
+# 用法(在 iStore 的 Docker 里):
+#   1) 把本文件放到 iStore 任意目录(如 /root/ange-clashboard/docker-compose.yml)
+#   2) docker compose up -d
+#   3) 浏览器访问 http://<iStore-IP>:2048
+#   4) 首次进面板，在「设置 → 后端」里填 OpenClash 控制器：
+#        地址: http://192.168.2.252:9090
+#        密钥: <你 OpenClash 配置里的 secret>
+#
+# 镜像由 GitHub Actions 自动构建并发布到 GHCR(多架构 amd64/arm64/arm）。
+# 更新面板：docker compose pull && docker compose up -d
+
+services:
+  ange-clashboard:
+    image: ghcr.io/kiss82053917/ange-clashboard:latest
+    container_name: ange-clashboard
+    restart: unless-stopped
+    ports:
+      - '2048:2048'
+    environment:
+      - NODE_ENV=production
+      - PORT=2048

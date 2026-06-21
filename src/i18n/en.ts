@@ -271,8 +271,7 @@ const en = {
   autoDetect: 'Auto detect',
   detectRuleSource: 'Detect rule source',
   detectRuleSourceFailed: 'Failed to detect rule source: {status}',
-  ruleSourceDetected:
-    'Detected {plugin}: {path}, {count} rule sources{availablePlugins}',
+  ruleSourceDetected: 'Detected {plugin}: {path}, {count} rule sources{availablePlugins}',
   ruleSourceDetectedShort: 'Detected {plugin}, {count} sources{availablePlugins}',
   ruleSourceDetectedAvailable: ', available {plugins}',
   ruleSourceSyncSshRequired:
@@ -345,6 +344,8 @@ const en = {
   autoCleanupIntervalNever: 'Never',
   remainingTraffic: 'Remaining',
   usedTraffic: 'Used',
+  todayTraffic: 'Today',
+  daysRemaining: '{days} days left',
   ruleHitCount: 'Hit: {count} times',
   ruleLastHit: 'Last hit: {time}',
   ruleMissCount: 'Miss: {count} times',
@@ -362,8 +363,7 @@ const en = {
   domainPenetrationMissingProviders: 'Missing cached rule providers',
   ruleLookupLoading: 'Querying rule cache...',
   ruleLookupEmpty: 'No rule cache hit.',
-  ruleLookupUnsupportedHint:
-    '{count} `.mrs` rule sets are not supported for parsing yet.',
+  ruleLookupUnsupportedHint: '{count} `.mrs` rule sets are not supported for parsing yet.',
   ruleLookupTopMatches: 'Only showing 10 most relevant rows:',
   ruleLookupUnsupportedProviders: 'Unsupported rule sets:',
   ruleLookupMissingRuleSet: 'No matching RuleSet found in the current rule order',

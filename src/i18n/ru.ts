@@ -276,8 +276,7 @@ const ru: LANG_MESSAGE = {
   autoDetect: 'Автоопределение',
   detectRuleSource: 'Проверить источник правил',
   detectRuleSourceFailed: 'Не удалось проверить источник правил: {status}',
-  ruleSourceDetected:
-    'Обнаружено {plugin}: {path}, источников правил: {count}{availablePlugins}',
+  ruleSourceDetected: 'Обнаружено {plugin}: {path}, источников правил: {count}{availablePlugins}',
   ruleSourceDetectedShort: 'Обнаружено {plugin}, источников: {count}{availablePlugins}',
   ruleSourceDetectedAvailable: ', доступно {plugins}',
   ruleSourceSyncSshRequired:
@@ -350,6 +349,8 @@ const ru: LANG_MESSAGE = {
   autoCleanupIntervalNever: 'Никогда',
   remainingTraffic: 'Осталось',
   usedTraffic: 'Использовано',
+  todayTraffic: 'Сегодня',
+  daysRemaining: 'Осталось {days} дн.',
   ruleHitCount: 'Попадание: {count} раз',
   ruleLastHit: 'Последнее попадание: {time}',
   ruleMissCount: 'Промах: {count} раз',
@@ -368,13 +369,11 @@ const ru: LANG_MESSAGE = {
   domainPenetrationMissingProviders: 'Следующие наборы правил отсутствуют в локальном кэше',
   ruleLookupLoading: 'Поиск в кэше правил...',
   ruleLookupEmpty: 'В кэше правил совпадений нет.',
-  ruleLookupUnsupportedHint:
-    '{count} наборов правил `.mrs` пока не поддерживаются для разбора.',
+  ruleLookupUnsupportedHint: '{count} наборов правил `.mrs` пока не поддерживаются для разбора.',
   ruleLookupTopMatches: 'Показаны только 10 наиболее релевантных строк:',
   ruleLookupUnsupportedProviders: 'Неподдерживаемые наборы правил:',
   ruleLookupMissingRuleSet: 'Соответствующий RuleSet не найден в текущем порядке правил',
-  ruleLookupFallbackMatched:
-    'В кэше правил совпадений нет. Трафик перейдет к резервному правилу',
+  ruleLookupFallbackMatched: 'В кэше правил совпадений нет. Трафик перейдет к резервному правилу',
   ruleSearchPlaceholder: 'Поиск домена / IP / ключевого слова',
   noReferencedRuleProviders: 'Нет используемых источников правил',
   ruleRefreshStopped: 'Обновление правил остановлено',

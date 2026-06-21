@@ -29,6 +29,10 @@ const en = {
   chains: 'Chains',
   outbound: 'Outbound',
   airport: 'Airport',
+  nodeDetail: 'Node details',
+  airportWarnThreshold: 'Traffic warning threshold',
+  airportWarnHint:
+    'Highlights the airport in red when its accumulated traffic exceeds the threshold (resets each cleanup cycle). Empty or 0 disables it.',
   sortBy: 'Sort by',
   rule: 'Rule',
   sourceIP: 'Source IP',

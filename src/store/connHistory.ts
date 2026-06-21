@@ -16,12 +16,13 @@ const isInitializedPromise = ref(
   }),
 )
 const uuid = () => activeBackend.value?.uuid || ''
+// 注意：Airport(机场)不单独持久化，由 Outbound(出站节点)数据按机场名归并而来，
+// 这样"机场总量"与"下钻的节点明细"始终一致，也避免重复存储。
 const allHistoryTypes = [
   ConnectionHistoryType.SourceIP,
   ConnectionHistoryType.Destination,
   ConnectionHistoryType.Process,
   ConnectionHistoryType.Outbound,
-  ConnectionHistoryType.Airport,
 ]
 
 // 从出口节点名提取机场名：取第一个竖线(半角|或全角｜)前的片段，再去掉开头的国旗/emoji

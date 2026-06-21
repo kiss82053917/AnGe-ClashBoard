@@ -135,6 +135,8 @@
                 transform: `translateY(${virtualRow.start - index * virtualRow.size}px)`,
               }"
               class="hover:bg-primary! hover:text-primary-content whitespace-nowrap"
+              :class="{ 'cursor-pointer': aggregationType === ConnectionHistoryType.Airport }"
+              @click="onRowClick(rows[virtualRow.index])"
             >
               <td
                 v-for="cell in rows[virtualRow.index].getVisibleCells()"
@@ -175,6 +177,52 @@
         </div>
       </div>
     </DialogWrapper>
+    <DialogWrapper
+      v-model="showDrill"
+      :title="`${drillAirport} · ${$t('nodeDetail')}`"
+    >
+      <div class="flex flex-col gap-3 p-2">
+        <div class="bg-base-200/50 flex flex-wrap items-center gap-2 rounded-lg p-3 text-sm">
+          <span class="font-medium">{{ $t('airportWarnThreshold') }}</span>
+          <input
+            type="number"
+            min="0"
+            class="input input-bordered input-sm w-24"
+            :value="drillThreshold || ''"
+            placeholder="0"
+            @input="setDrillThreshold(($event.target as HTMLInputElement).value)"
+          />
+          <span>GB</span>
+          <span class="text-base-content/60 w-full text-xs">{{ $t('airportWarnHint') }}</span>
+        </div>
+        <div class="max-h-96 overflow-auto">
+          <table class="table-sm table-zebra table w-full">
+            <thead class="bg-base-200 sticky top-0 z-10">
+              <tr>
+                <th>{{ $t('outbound') }}</th>
+                <th>{{ $t('download') }}</th>
+                <th>{{ $t('upload') }}</th>
+                <th>{{ $t('totalTraffic') }}</th>
+                <th>{{ $t('connectionCount') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="n in drillNodes"
+                :key="n.key"
+                class="whitespace-nowrap"
+              >
+                <td><ProxyName :name="n.key" /></td>
+                <td>{{ prettyBytesHelper(n.download) }}</td>
+                <td>{{ prettyBytesHelper(n.upload) }}</td>
+                <td>{{ prettyBytesHelper(n.download + n.upload) }}</td>
+                <td>{{ n.count }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </DialogWrapper>
   </div>
 </template>
 
@@ -187,6 +235,7 @@ import { prettyBytesHelper } from '@/helper/utils'
 import {
   aggregateConnections,
   aggregatedDataMap,
+  airportOfNode,
   initAggregatedDataMap,
   mergeAggregatedData,
 } from '@/store/connHistory'
@@ -235,9 +284,34 @@ const aggregationType = useStorage<ConnectionHistoryType>(
   ConnectionHistoryType.SourceIP,
 )
 const historicalData = computed(() => aggregatedDataMap.value[aggregationType.value])
-const aggregatedData = computed<ConnectionHistoryData[]>(() => {
-  const currentData = aggregateConnections(activeConnections.value, aggregationType.value)
 
+// 出站节点维度的完整数据(历史+当前活跃);机场维度由它归并而来,保证机场总量与下钻明细一致
+const outboundData = computed<ConnectionHistoryData[]>(() => {
+  const current = aggregateConnections(activeConnections.value, ConnectionHistoryType.Outbound)
+  return mergeAggregatedData(aggregatedDataMap.value[ConnectionHistoryType.Outbound], current)
+})
+
+const groupByAirport = (nodes: ConnectionHistoryData[]): ConnectionHistoryData[] => {
+  const map = new Map<string, ConnectionHistoryData>()
+  for (const n of nodes) {
+    const key = airportOfNode(n.key)
+    const existing = map.get(key)
+    if (existing) {
+      existing.download += n.download
+      existing.upload += n.upload
+      existing.count += n.count
+    } else {
+      map.set(key, { key, download: n.download, upload: n.upload, count: n.count })
+    }
+  }
+  return Array.from(map.values())
+}
+
+const aggregatedData = computed<ConnectionHistoryData[]>(() => {
+  if (aggregationType.value === ConnectionHistoryType.Airport) {
+    return groupByAirport(outboundData.value)
+  }
+  const currentData = aggregateConnections(activeConnections.value, aggregationType.value)
   return mergeAggregatedData(historicalData.value, currentData)
 })
 
@@ -269,6 +343,46 @@ const aggregateSourceLabel = computed(() => {
   }
 })
 
+// 单机场累计流量预警阈值(GB){ 机场名: GB };0/留空 = 不预警
+const airportWarnMap = useStorage<Record<string, number>>('overview/airport-traffic-warn-gb', {})
+const isAirportOverWarn = (name: string, total: number): boolean => {
+  const gb = airportWarnMap.value[name]
+  return !!gb && gb > 0 && total > gb * 1024 ** 3
+}
+
+// 机场下钻:点击机场行 → 弹出该机场的节点明细 + 设置该机场的流量预警
+const drillAirport = ref<string | null>(null)
+const showDrill = computed({
+  get: () => drillAirport.value !== null,
+  set: (v: boolean) => {
+    if (!v) drillAirport.value = null
+  },
+})
+const drillNodes = computed<ConnectionHistoryData[]>(() => {
+  if (!drillAirport.value) return []
+  return outboundData.value
+    .filter((n) => airportOfNode(n.key) === drillAirport.value)
+    .sort((a, b) => b.download + b.upload - (a.download + a.upload))
+})
+const drillThreshold = computed(() => airportWarnMap.value[drillAirport.value ?? ''] ?? 0)
+const setDrillThreshold = (val: string) => {
+  const name = drillAirport.value
+  if (!name) return
+  const num = Number(val)
+  const next = { ...airportWarnMap.value }
+  if (!num || num <= 0) {
+    delete next[name]
+  } else {
+    next[name] = num
+  }
+  airportWarnMap.value = next
+}
+const onRowClick = (row?: { original: ConnectionHistoryData }) => {
+  if (row && aggregationType.value === ConnectionHistoryType.Airport) {
+    drillAirport.value = row.original.key
+  }
+}
+
 const columns = computed<ColumnDef<ConnectionHistoryData>[]>(() => {
   const keyColumn: ColumnDef<ConnectionHistoryData> = {
     header: () => aggregateSourceLabel.value,
@@ -282,7 +396,15 @@ const columns = computed<ColumnDef<ConnectionHistoryData>[]>(() => {
       } else if (aggregationType.value === ConnectionHistoryType.Process) {
         return row.original.key
       } else if (aggregationType.value === ConnectionHistoryType.Airport) {
-        return row.original.key
+        const over = isAirportOverWarn(
+          row.original.key,
+          row.original.download + row.original.upload,
+        )
+        return h(
+          'div',
+          { class: ['flex items-center gap-1', over ? 'text-error font-medium' : ''] },
+          [row.original.key, over ? h('span', '⚠️') : null],
+        )
       } else {
         return h(ProxyName, { name: row.original.key })
       }

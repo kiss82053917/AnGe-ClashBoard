@@ -31,6 +31,10 @@ const zhTW: LANG_MESSAGE = {
   chains: '代理鏈',
   outbound: '出站節點',
   airport: '機場',
+  nodeDetail: '節點明細',
+  airportWarnThreshold: '流量預警閾值',
+  airportWarnHint:
+    '超過閾值時該機場標紅⚠️;統計的是累計流量,隨清理週期(預設每月)重置。留空或 0 = 不預警。',
   sortBy: '排序方式',
   rule: '規則',
   sourceIP: '源IP',

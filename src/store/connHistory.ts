@@ -21,13 +21,27 @@ const allHistoryTypes = [
   ConnectionHistoryType.Destination,
   ConnectionHistoryType.Process,
   ConnectionHistoryType.Outbound,
+  ConnectionHistoryType.Airport,
 ]
+
+// 从出口节点名提取机场名：取第一个竖线(半角|或全角｜)前的片段，再去掉开头的国旗/emoji
+// 例: "🇭🇰 速鹰 |  V4-3684|香港" → "速鹰"; "猫耳云 | 🇹🇼台湾01｜三网" → "猫耳云"; "直连" → "直连"
+export const airportOfNode = (node: string): string => {
+  if (!node) return '-'
+  const head = node.split(/[|｜]/)[0]
+  const cleaned = head
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '') // 区域指示符(国旗)
+    .replace(/[\u{2600}-\u{27BF}\u{1F300}-\u{1FAFF}\u{2190}-\u{21FF}\u{FE0F}\u{200D}]/gu, '') // 杂项符号/emoji
+    .trim()
+  return cleaned || node.trim()
+}
 
 export const aggregatedDataMap = ref<Record<ConnectionHistoryType, ConnectionHistoryData[]>>({
   [ConnectionHistoryType.SourceIP]: [],
   [ConnectionHistoryType.Destination]: [],
   [ConnectionHistoryType.Process]: [],
   [ConnectionHistoryType.Outbound]: [],
+  [ConnectionHistoryType.Airport]: [],
 })
 
 export const initAggregatedDataMap = () => {
@@ -36,6 +50,7 @@ export const initAggregatedDataMap = () => {
     [ConnectionHistoryType.Destination]: [],
     [ConnectionHistoryType.Process]: [],
     [ConnectionHistoryType.Outbound]: [],
+    [ConnectionHistoryType.Airport]: [],
   }
   isInitializedPromise.value = new Promise(async (resolve) => {
     for (const type of allHistoryTypes) {
@@ -78,6 +93,8 @@ export const aggregateConnections = (
       key = getProcessFromConnection(connection)
     } else if (type === ConnectionHistoryType.Outbound) {
       key = connection.chains[0] || '-'
+    } else if (type === ConnectionHistoryType.Airport) {
+      key = airportOfNode(connection.chains[0] || '-')
     }
 
     if (map.has(key)) {

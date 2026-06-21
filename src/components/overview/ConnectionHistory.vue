@@ -34,6 +34,9 @@
               <option :value="ConnectionHistoryType.Outbound">
                 {{ $t('aggregateByOutbound') }}
               </option>
+              <option :value="ConnectionHistoryType.Airport">
+                {{ $t('aggregateByAirport') }}
+              </option>
             </select>
           </div>
           <div class="flex items-center gap-2">
@@ -259,6 +262,8 @@ const aggregateSourceLabel = computed(() => {
     return t('host')
   } else if (aggregationType.value === ConnectionHistoryType.Process) {
     return t('process')
+  } else if (aggregationType.value === ConnectionHistoryType.Airport) {
+    return t('airport')
   } else {
     return t('outbound')
   }
@@ -275,6 +280,8 @@ const columns = computed<ColumnDef<ConnectionHistoryData>[]>(() => {
       } else if (aggregationType.value === ConnectionHistoryType.Destination) {
         return row.original.key
       } else if (aggregationType.value === ConnectionHistoryType.Process) {
+        return row.original.key
+      } else if (aggregationType.value === ConnectionHistoryType.Airport) {
         return row.original.key
       } else {
         return h(ProxyName, { name: row.original.key })

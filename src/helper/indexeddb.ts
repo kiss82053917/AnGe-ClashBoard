@@ -220,6 +220,7 @@ export enum ConnectionHistoryType {
   Destination = 'destination',
   Process = 'process',
   Outbound = 'outbound',
+  Airport = 'airport',
 }
 
 const connectionHistoryDB = useIndexedDB('connection-history')

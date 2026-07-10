@@ -5,6 +5,7 @@ import {
   fetchProxyGroupLatencyAPI,
   fetchProxyLatencyAPI,
   fetchProxyProviderAPI,
+  fetchProxyProviderNodeLatencyAPI,
   isSingBox,
   selectProxyAPI,
 } from '@/api'
@@ -321,12 +322,25 @@ export const handlerProxySelect = async (proxyGroupName: string, proxyName: stri
   fetchProxies()
 }
 
+// Route the delay test to the correct mihomo endpoint: nodes that come from a
+// proxy-provider are not exposed at /proxies/<name>/delay (404), so test them via
+// the provider's per-node health-check endpoint instead.
+const latencyTestForNode = (proxyName: string, url: string, timeout: number) => {
+  const providerName = getProxyProviderName(proxyName)
+
+  if (providerName) {
+    return fetchProxyProviderNodeLatencyAPI(providerName, proxyName, url, timeout)
+  }
+
+  return fetchProxyLatencyAPI(proxyName, url, timeout)
+}
+
 const latencyTestForSingle = async (proxyName: string, url: string, timeout: number) => {
   const now = getNowProxyNodeName(proxyName)
 
   if (IPv6test.value) {
     try {
-      const { data: ipv6LatencyResult } = await fetchProxyLatencyAPI(now, IPV6_TEST_URL, 2000)
+      const { data: ipv6LatencyResult } = await latencyTestForNode(now, IPV6_TEST_URL, 2000)
 
       IPv6Map.value[now] = ipv6LatencyResult.delay > NOT_CONNECTED
     } catch {
@@ -334,7 +348,7 @@ const latencyTestForSingle = async (proxyName: string, url: string, timeout: num
     }
   }
 
-  return await fetchProxyLatencyAPI(independentLatencyTest.value ? proxyName : now, url, timeout)
+  return await latencyTestForNode(independentLatencyTest.value ? proxyName : now, url, timeout)
 }
 
 const getNameForNotification = (name: string, url: string) => {

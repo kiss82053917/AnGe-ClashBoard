@@ -129,6 +129,25 @@ export const fetchProxyLatencyAPI = (proxyName: string, url: string, timeout: nu
   })
 }
 
+// Provider-sourced nodes are not addressable via /proxies/<name>/delay (mihomo returns 404),
+// so they must be tested through the provider's per-node health-check endpoint instead.
+export const fetchProxyProviderNodeLatencyAPI = (
+  providerName: string,
+  proxyName: string,
+  url: string,
+  timeout: number,
+) => {
+  return axios.get<{ delay: number }>(
+    `/providers/proxies/${encodeURIComponent(providerName)}/${encodeURIComponent(proxyName)}/healthcheck`,
+    {
+      params: {
+        url,
+        timeout,
+      },
+    },
+  )
+}
+
 export const fetchProxyGroupLatencyAPI = (proxyName: string, url: string, timeout: number) => {
   return axios.get<Record<string, number>>(`/group/${encodeURIComponent(proxyName)}/delay`, {
     params: {
